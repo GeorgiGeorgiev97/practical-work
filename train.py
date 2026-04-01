@@ -19,7 +19,7 @@ class OCTDataset(Dataset):
     CLASS_NAMES = ['CNV', 'DME', 'DRUSEN', 'NORMAL']
     CLASS_TO_IDX = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 
-    def __init__(self, image_dir, max_images=None, transform=None, return_labels=True):
+    def __init__(self, image_dir, max_images=None, transform=None, return_labels=True, include_classes=None):
         self.image_paths = []
         self.labels = []
         self.transform = transform
@@ -27,16 +27,20 @@ class OCTDataset(Dataset):
 
         image_dir = Path(image_dir)
 
+        # Use a subset of classes if specified, remapping indices to 0..N-1
+        active_classes = include_classes if include_classes is not None else self.CLASS_NAMES
+        active_class_to_idx = {name: idx for idx, name in enumerate(active_classes)}
+
         subdirs = [d for d in image_dir.iterdir() if d.is_dir()]
 
         if subdirs and any(d.name in self.CLASS_NAMES for d in subdirs):
             # Load from each class subfolder
-            for class_name in self.CLASS_NAMES:
+            for class_name in active_classes:
                 class_dir = image_dir / class_name
                 if class_dir.exists():
                     class_images = list(class_dir.glob('*.jpeg'))
                     self.image_paths.extend(class_images)
-                    self.labels.extend([self.CLASS_TO_IDX[class_name]] * len(class_images))
+                    self.labels.extend([active_class_to_idx[class_name]] * len(class_images))
 
         else:
             # Single folder: all images get label 0
@@ -139,29 +143,29 @@ def evaluate_with_entropy(model, dataset, device, desc="Evaluating"):
 def main():
 
     # Config
-    NUM_TRAIN_IMAGES = 60000     # None to use all images
+    NUM_TRAIN_IMAGES = None     # None to use all images
     NUM_TEST_INLIER = 500        # Number of inliers to test
     NUM_TEST_OUTLIER = None      # None to test all outliers
     NUM_EPOCHS = 20              # Number of epochs
     BATCH_SIZE = 16              # Batch size
     IMAGE_SIZE = 224             # Image size 224/128
 
+    # 3-classes in-distribution: CNV, DRUSEN, NORMAL
+    TRAIN_CLASSES = ['CNV', 'DRUSEN', 'NORMAL']
+
     # Paths
-    # In-distribution: OCT dataset (CNV, DME, DRUSEN, NORMAL)
-    # Out-of-distribution: OCTID dataset
     oct_test_dir = "data/OCT/test"
     oct_train_dir = "data/OCT/train"
-    octid_dir = "data/OCTID"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nUsing device: {device}")
 
     mlflow.set_experiment("oct-ood-detection")
-    mlflow.start_run(run_name=f"densenet-{NUM_EPOCHS}ep-{IMAGE_SIZE}px")
+    mlflow.start_run(run_name=f"densenet-3class-dme-ood-{NUM_EPOCHS}ep-{IMAGE_SIZE}px")
 
     config = {
         'input_shape': [3, IMAGE_SIZE, IMAGE_SIZE],
-        'num_classes': 4,  # CNV, DME, DRUSEN, NORMAL
+        'num_classes': 3,  # CNV, DRUSEN, NORMAL
         'backbone': 'densenet',
         'optimizer_type': 'adam',
         'optimizer_mom': 0.9,
@@ -213,7 +217,8 @@ def main():
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
-    full_dataset = OCTDataset(oct_train_dir, max_images=NUM_TRAIN_IMAGES, transform=transform)
+    full_dataset = OCTDataset(oct_train_dir, max_images=NUM_TRAIN_IMAGES, transform=transform,
+                              include_classes=TRAIN_CLASSES)
 
     # Split into train/val (80/20)
     val_size = int(0.2 * len(full_dataset))
@@ -221,8 +226,8 @@ def main():
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
     train_labels = [full_dataset.labels[i] for i in train_dataset.indices]
-    class_counts = np.bincount(train_labels, minlength=4)
-    print(f"Class distribution: CNV={class_counts[0]}, DME={class_counts[1]}, DRUSEN={class_counts[2]}, NORMAL={class_counts[3]}")
+    class_counts = np.bincount(train_labels, minlength=len(TRAIN_CLASSES))
+    print(f"Class distribution: " + ", ".join(f"{c}={class_counts[i]}" for i, c in enumerate(TRAIN_CLASSES)))
 
     # Create weighted sampler (inverse frequency)
     sample_weights = [1.0 / class_counts[label] for label in train_labels]
@@ -267,30 +272,19 @@ def main():
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
-    # Inliers
-    inlier_dataset = OCTDataset(oct_test_dir, max_images=NUM_TEST_INLIER, transform=test_transform)
-    inlier_entropies = evaluate_with_entropy(model, inlier_dataset, device, "Inliers (OCT)")
+    # Inliers: CNV, DRUSEN, NORMAL from OCT test set
+    inlier_dataset = OCTDataset(oct_test_dir, max_images=NUM_TEST_INLIER, transform=test_transform,
+                                include_classes=TRAIN_CLASSES)
+    inlier_entropies = evaluate_with_entropy(model, inlier_dataset, device, "Inliers (OCT: CNV/DRUSEN/NORMAL)")
 
-    # Outliers
-    outlier_entropies = []
-    outlier_labels = []
+    # OOD: DME from OCT test set
+    dme_test_dir = Path(oct_test_dir) / 'DME'
+    dme_dataset = OCTDataset(dme_test_dir, max_images=NUM_TEST_OUTLIER, transform=test_transform)
+    outlier_entropies = evaluate_with_entropy(model, dme_dataset, device, "OOD: DME (OCT test)")
+    outlier_labels = ['DME'] * len(outlier_entropies)
 
-    octid_path = Path(octid_dir)
-    for disease_dir in octid_path.iterdir():
-        if not disease_dir.is_dir():
-            continue
-
-        print(f"{disease_dir.name}")
-        disease_dataset = OCTDataset(disease_dir, max_images=NUM_TEST_OUTLIER, transform=test_transform)
-        disease_entropies = evaluate_with_entropy(model, disease_dataset, device, f"   {disease_dir.name}")
-
-        outlier_entropies.extend(disease_entropies)
-        outlier_labels.extend([disease_dir.name] * len(disease_entropies))
-
-    outlier_entropies = np.array(outlier_entropies)
-
-    print(f"INLIERS  (OCT): {np.mean(inlier_entropies):.4f} ± {np.std(inlier_entropies):.4f}")
-    print(f"OUTLIERS (OCTID): {np.mean(outlier_entropies):.4f} ± {np.std(outlier_entropies):.4f}")
+    print(f"INLIERS  (CNV/DRUSEN/NORMAL): {np.mean(inlier_entropies):.4f} ± {np.std(inlier_entropies):.4f}")
+    print(f"OUTLIERS (DME):               {np.mean(outlier_entropies):.4f} ± {np.std(outlier_entropies):.4f}")
     print(f"Difference: {np.mean(outlier_entropies) - np.mean(inlier_entropies):.4f}")
 
     y_true = np.concatenate([np.ones(len(inlier_entropies)), np.zeros(len(outlier_entropies))])
@@ -368,11 +362,8 @@ def main():
 
     plt.figure(figsize=(12, 6))
 
-    unique_diseases = list(set(outlier_labels))
-    disease_entropies = [outlier_entropies[np.array(outlier_labels) == d] for d in unique_diseases]
-
-    plt.boxplot([inlier_entropies] + disease_entropies,
-                labels=['OCT (In)'] + unique_diseases,
+    plt.boxplot([inlier_entropies, outlier_entropies],
+                labels=['CNV/DRUSEN/NORMAL (In)', 'DME (OOD)'],
                 patch_artist=True)
     plt.xticks(rotation=45, ha='right')
     plt.ylabel('Entropy')

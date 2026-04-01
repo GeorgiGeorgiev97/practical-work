@@ -2,4 +2,8 @@
 .idea
 data
 mlflow.db
+mlruns/
 __pycache__/
+*.pdf
+*.pth
+*.png
